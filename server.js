@@ -14,23 +14,30 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3000;
 
-// -------- Game rules (MVP) --------
-// Use standard deck mapped to values (Ace=1, 2-10 as is, J=11, Q=12, K=13)
-// 4 cards per player, initial peek 2 cards.
+// =====================
+// Deck + Values
+// =====================
+const suits = ["S", "H", "D", "C"];
+const ranks = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"];
+
 function makeDeck() {
-  const suits = ["S", "H", "D", "C"];
-  const ranks = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"];
   const deck = [];
   for (const s of suits) for (const r of ranks) deck.push({ r, s });
   return deck;
 }
 
-function valueOf(card) {
+function baseValue(card) {
   if (card.r === "A") return 1;
   if (card.r === "J") return 11;
   if (card.r === "Q") return 12;
   if (card.r === "K") return 13;
   return parseInt(card.r, 10);
+}
+
+// scoring value: K♥ / K♦ is -1 if held in hand
+function scoreValue(card) {
+  if (card.r === "K" && (card.s === "H" || card.s === "D")) return -1;
+  return baseValue(card);
 }
 
 function shuffle(a) {
@@ -45,63 +52,35 @@ function roomId() {
   return Math.random().toString(36).slice(2, 7).toUpperCase();
 }
 
-const rooms = new Map();
+// =====================
+// Rooms
+// =====================
 /**
 room = {
   id,
-  players: [{ socketId, name, peeksLeft, hand:[card,card,card,card] }],
+  players: [{ socketId, name, peeksLeft, hand:[card*4] }],
   started,
   turnIndex,
-  drawPile: [card...],
-  discardPile: [card...],
-  phase: "PEEK"|"TURN_DRAW"|"TURN_DECIDE"|"LAST_TURN"|"ENDED",
+  drawPile,
+  discardPile,
+  phase: "LOBBY"|"PEEK"|"TURN_DRAW"|"TURN_DECIDE"|"LAST_TURN"|"ENDED",
   activeDraw: null | { source:"draw"|"discard", card },
-  caboCalledBy: null | socketId,
-  lastTurnFor: null | socketId,
-  log: [string...],
-  ended: { scores: [{name,score}], winnerName }
+  caboCalledBy: null|socketId,
+  lastTurnFor: null|socketId,
+  skipNextFor: null|socketId,          // if set, that player is skipped once
+  pending: null | {                    // for multi-step powers (King confirm)
+    type: "KING_CONFIRM",
+    playerSocketId,
+    myIndex,
+    oppIndex,
+    kingCard
+  },
+  log,
+  ended
 }
 */
 
-function publicState(room, viewerSocketId) {
-  const players = room.players.map(p => {
-    const isMe = p.socketId === viewerSocketId;
-    return {
-      socketId: p.socketId,
-      name: p.name,
-      peeksLeft: p.peeksLeft,
-      // hide hand values unless game ended; if ended reveal all
-      hand: room.phase === "ENDED"
-        ? p.hand.map(c => ({ ...c, v: valueOf(c) }))
-        : p.hand.map(() => null),
-      // during PEEK only reveal for self by separate event; so keep null here
-      isMe
-    };
-  });
-
-  return {
-    id: room.id,
-    started: room.started,
-    phase: room.phase,
-    players,
-    turnSocketId: room.started ? room.players[room.turnIndex]?.socketId : null,
-    drawCount: room.drawPile.length,
-    discardTop: room.discardPile[room.discardPile.length - 1] || null,
-    activeDraw: room.activeDraw
-      ? { source: room.activeDraw.source, card: (room.activeDraw.source === "discard" ? room.activeDraw.card : null) }
-      : null,
-    caboCalledBy: room.caboCalledBy,
-    lastTurnFor: room.lastTurnFor,
-    log: room.log.slice(-8),
-    ended: room.ended || null
-  };
-}
-
-function emitRoom(room) {
-  for (const p of room.players) {
-    io.to(p.socketId).emit("room:update", publicState(room, p.socketId));
-  }
-}
+const rooms = new Map();
 
 function getRoomOrThrow(id) {
   const room = rooms.get(id);
@@ -115,20 +94,34 @@ function ensurePlayer(room, socketId) {
   return idx;
 }
 
-function ensureTurn(room, socketId) {
-  if (room.players[room.turnIndex]?.socketId !== socketId) {
-    throw new Error("Not your turn");
-  }
+function currentTurnSocket(room) {
+  return room.players[room.turnIndex]?.socketId ?? null;
 }
 
-// Start game when 2 players are present and host triggers
+function ensureTurn(room, socketId) {
+  if (currentTurnSocket(room) !== socketId) throw new Error("Not your turn");
+}
+
+function computeHandSumForCabo(room, socketId) {
+  const p = room.players.find(x => x.socketId === socketId);
+  if (!p) throw new Error("Not in room");
+  return p.hand.reduce((sum, c) => sum + scoreValue(c), 0);
+}
+
+function isPowerCard(card) {
+  // 7/8/9/10/J/Q/K are powers
+  return ["7","8","9","10","J","Q","K"].includes(card.r);
+}
+
 function startGame(room) {
   if (room.players.length !== 2) throw new Error("Need 2 players");
+
   const deck = shuffle(makeDeck());
   for (const p of room.players) {
     p.hand = [deck.pop(), deck.pop(), deck.pop(), deck.pop()];
     p.peeksLeft = 2;
   }
+
   room.drawPile = deck;
   room.discardPile = [room.drawPile.pop()];
   room.started = true;
@@ -137,18 +130,103 @@ function startGame(room) {
   room.activeDraw = null;
   room.caboCalledBy = null;
   room.lastTurnFor = null;
+  room.skipNextFor = null;
+  room.pending = null;
   room.log = ["Game started. Each player: peek 2 cards."];
+  room.ended = null;
 }
 
 function scores(room) {
   const s = room.players.map(p => ({
     name: p.name,
-    score: p.hand.reduce((sum, c) => sum + valueOf(c), 0)
+    score: p.hand.reduce((sum, c) => sum + scoreValue(c), 0)
   }));
   s.sort((a,b)=>a.score-b.score);
   return { scores: s, winnerName: s[0].name };
 }
 
+function publicState(room, viewerSocketId) {
+  const players = room.players.map(p => {
+    const isMe = p.socketId === viewerSocketId;
+    return {
+      socketId: p.socketId,
+      name: p.name,
+      peeksLeft: p.peeksLeft,
+      hand: room.phase === "ENDED"
+        ? p.hand.map(c => ({ ...c, base: baseValue(c), score: scoreValue(c) }))
+        : p.hand.map(() => null),
+      isMe
+    };
+  });
+
+  // Only show discard top publicly
+  const discardTop = room.discardPile[room.discardPile.length - 1] || null;
+
+  // Active draw should NOT reveal draw-pile card to opponent
+  const activeDrawPublic = room.activeDraw
+    ? {
+        source: room.activeDraw.source,
+        card: (room.activeDraw.source === "discard") ? { ...room.activeDraw.card, base: baseValue(room.activeDraw.card) } : null
+      }
+    : null;
+
+  return {
+    id: room.id,
+    started: room.started,
+    phase: room.phase,
+    players,
+    turnSocketId: room.started ? currentTurnSocket(room) : null,
+    drawCount: room.drawPile.length,
+    discardTop: discardTop ? { ...discardTop, base: baseValue(discardTop) } : null,
+    activeDraw: activeDrawPublic,
+    caboCalledBy: room.caboCalledBy,
+    lastTurnFor: room.lastTurnFor,
+    log: room.log.slice(-10),
+    ended: room.ended || null
+  };
+}
+
+function emitRoom(room) {
+  for (const p of room.players) {
+    io.to(p.socketId).emit("room:update", publicState(room, p.socketId));
+  }
+}
+
+function endRound(room) {
+  room.phase = "ENDED";
+  room.ended = scores(room);
+  room.log.push(`Round ended. Winner: ${room.ended.winnerName}`);
+}
+
+function advanceTurn(room) {
+  // Finish last-turn?
+  if (room.lastTurnFor && currentTurnSocket(room) === room.lastTurnFor) {
+    // That player just completed their last turn -> end
+    endRound(room);
+    return;
+  }
+
+  // normal next
+  room.turnIndex = (room.turnIndex + 1) % room.players.length;
+
+  // skip logic
+  const nextSock = currentTurnSocket(room);
+  if (room.skipNextFor && room.skipNextFor === nextSock) {
+    room.log.push(`${room.players[room.turnIndex].name} was skipped.`);
+    room.skipNextFor = null;
+    // skip once more to the following player
+    room.turnIndex = (room.turnIndex + 1) % room.players.length;
+  }
+
+  room.phase = "TURN_DRAW";
+  room.activeDraw = null;
+  room.pending = null;
+  room.log.push(`${room.players[room.turnIndex].name}'s turn.`);
+}
+
+// =====================
+// Socket handlers
+// =====================
 io.on("connection", (socket) => {
   socket.on("room:create", ({ name }, cb) => {
     try {
@@ -164,7 +242,10 @@ io.on("connection", (socket) => {
         activeDraw: null,
         caboCalledBy: null,
         lastTurnFor: null,
-        log: []
+        skipNextFor: null,
+        pending: null,
+        log: [],
+        ended: null
       };
       rooms.set(id, room);
 
@@ -217,6 +298,7 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Initial peek phase (2 peeks)
   socket.on("game:peek", ({ roomId, index }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -225,17 +307,21 @@ io.on("connection", (socket) => {
       const p = room.players[pIdx];
       if (p.peeksLeft <= 0) throw new Error("No peeks left");
       if (![0,1,2,3].includes(index)) throw new Error("Bad index");
+
       p.peeksLeft -= 1;
 
-      // Send only to that player (private info)
-      socket.emit("peek:result", { index, card: { ...p.hand[index], v: valueOf(p.hand[index]) }, peeksLeft: p.peeksLeft });
+      socket.emit("peek:result", {
+        index,
+        card: { ...p.hand[index], base: baseValue(p.hand[index]), score: scoreValue(p.hand[index]) },
+        peeksLeft: p.peeksLeft
+      });
 
       room.log.push(`${p.name} peeked a card.`);
-      // If both players done peeking, move to turn phase
       if (room.players.every(x => x.peeksLeft === 0)) {
         room.phase = "TURN_DRAW";
         room.log.push(`Peeks done. ${room.players[room.turnIndex].name}'s turn.`);
       }
+
       emitRoom(room);
       cb?.({ ok: true });
     } catch (e) {
@@ -243,12 +329,14 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Take card from draw or discard
   socket.on("turn:take", ({ roomId, source }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
       if (!["TURN_DRAW","LAST_TURN"].includes(room.phase)) throw new Error("Not in draw phase");
       ensureTurn(room, socket.id);
-      if (room.activeDraw) throw new Error("Already drew a card");
+      if (room.activeDraw) throw new Error("Already took a card");
+      if (room.pending) throw new Error("Resolve pending action first");
 
       let card;
       if (source === "draw") {
@@ -262,24 +350,13 @@ io.on("connection", (socket) => {
       room.activeDraw = { source, card };
       room.phase = "TURN_DECIDE";
       room.log.push(`${room.players[room.turnIndex].name} took a card.`);
-      emitRoom(room);
-      cb?.({ ok: true, card: source === "discard" ? { ...card, v: valueOf(card) } : null });
-    } catch (e) {
-      cb?.({ ok: false, error: e.message });
-    }
-  });
 
-  socket.on("turn:discardDrawn", ({ roomId }, cb) => {
-    try {
-      const room = getRoomOrThrow(roomId);
-      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
-      ensureTurn(room, socket.id);
-      if (!room.activeDraw) throw new Error("No drawn card");
+      // Reveal drawn card privately to the player (even from draw pile)
+      socket.emit("turn:drawResult", {
+        card: { ...card, base: baseValue(card), score: scoreValue(card) },
+        power: isPowerCard(card)
+      });
 
-      room.discardPile.push(room.activeDraw.card);
-      room.activeDraw = null;
-      room.log.push(`${room.players[room.turnIndex].name} discarded drawn card.`);
-      advanceTurn(room);
       emitRoom(room);
       cb?.({ ok: true });
     } catch (e) {
@@ -287,6 +364,7 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Swap drawn card into hand
   socket.on("turn:swap", ({ roomId, handIndex }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -294,6 +372,7 @@ io.on("connection", (socket) => {
       ensureTurn(room, socket.id);
       if (!room.activeDraw) throw new Error("No drawn card");
       if (![0,1,2,3].includes(handIndex)) throw new Error("Bad index");
+      if (room.pending) throw new Error("Resolve pending action first");
 
       const p = room.players[room.turnIndex];
       const old = p.hand[handIndex];
@@ -310,20 +389,47 @@ io.on("connection", (socket) => {
     }
   });
 
+  // Discard drawn card (no power)
+  socket.on("turn:discardDrawn", ({ roomId }, cb) => {
+    try {
+      const room = getRoomOrThrow(roomId);
+      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
+      ensureTurn(room, socket.id);
+      if (!room.activeDraw) throw new Error("No drawn card");
+      if (room.pending) throw new Error("Resolve pending action first");
+
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+
+      room.log.push(`${room.players[room.turnIndex].name} discarded drawn card.`);
+      advanceTurn(room);
+      emitRoom(room);
+      cb?.({ ok: true });
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  // CABO call (only allowed when <= 5)
   socket.on("turn:cabo", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
-      if (!["TURN_DRAW","TURN_DECIDE"].includes(room.phase)) throw new Error("Can't call cabo now");
+      if (room.phase !== "TURN_DRAW") throw new Error("Call Cabo at start of your turn");
       ensureTurn(room, socket.id);
+
+      const sum = computeHandSumForCabo(room, socket.id);
+      if (sum > 5) throw new Error("Cabo not allowed (total must be 5 or less).");
 
       room.caboCalledBy = socket.id;
       const opponent = room.players.find(p => p.socketId !== socket.id);
       room.lastTurnFor = opponent.socketId;
-      room.phase = "LAST_TURN";
-      room.activeDraw = null; // force fresh draw step
+
       room.log.push(`${room.players[room.turnIndex].name} called CABO! ${opponent.name} gets last turn.`);
-      // give last turn to opponent
+      // Give opponent last turn
       room.turnIndex = room.players.findIndex(p => p.socketId === opponent.socketId);
+      room.phase = "LAST_TURN";
+      room.activeDraw = null;
+      room.pending = null;
 
       emitRoom(room);
       cb?.({ ok: true });
@@ -332,19 +438,219 @@ io.on("connection", (socket) => {
     }
   });
 
+  // =====================
+  // POWERS (Option B)
+  // Use power => drawn card is discarded after effect
+  // =====================
+
+  socket.on("power:peekOwn", ({ roomId, handIndex }, cb) => {
+    try {
+      const room = getRoomOrThrow(roomId);
+      ensureTurn(room, socket.id);
+      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
+      if (!room.activeDraw) throw new Error("No drawn card");
+      const c = room.activeDraw.card;
+      if (!["7","8"].includes(c.r)) throw new Error("Not a peek-own card");
+      if (![0,1,2,3].includes(handIndex)) throw new Error("Bad index");
+
+      const p = room.players[room.turnIndex];
+      socket.emit("power:reveal", {
+        kind: "own",
+        index: handIndex,
+        card: { ...p.hand[handIndex], base: baseValue(p.hand[handIndex]), score: scoreValue(p.hand[handIndex]) }
+      });
+
+      // discard drawn power card
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+
+      room.log.push(`${p.name} used 7/8 to peek own card.`);
+      advanceTurn(room);
+      emitRoom(room);
+      cb?.({ ok: true });
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  socket.on("power:peekOpp", ({ roomId, oppIndex }, cb) => {
+    try {
+      const room = getRoomOrThrow(roomId);
+      ensureTurn(room, socket.id);
+      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
+      if (!room.activeDraw) throw new Error("No drawn card");
+      const c = room.activeDraw.card;
+      if (!["9","10"].includes(c.r)) throw new Error("Not a peek-opponent card");
+      if (![0,1,2,3].includes(oppIndex)) throw new Error("Bad index");
+
+      const meIdx = room.turnIndex;
+      const opp = room.players[(meIdx + 1) % 2];
+
+      socket.emit("power:reveal", {
+        kind: "opp",
+        index: oppIndex,
+        card: { ...opp.hand[oppIndex], base: baseValue(opp.hand[oppIndex]), score: scoreValue(opp.hand[oppIndex]) }
+      });
+
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+
+      room.log.push(`${room.players[meIdx].name} used 9/10 to peek opponent.`);
+      advanceTurn(room);
+      emitRoom(room);
+      cb?.({ ok: true });
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  socket.on("power:jackSkip", ({ roomId }, cb) => {
+    try {
+      const room = getRoomOrThrow(roomId);
+      ensureTurn(room, socket.id);
+      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
+      if (!room.activeDraw) throw new Error("No drawn card");
+      const c = room.activeDraw.card;
+      if (c.r !== "J") throw new Error("Not a Jack");
+
+      const meIdx = room.turnIndex;
+      const opp = room.players[(meIdx + 1) % 2];
+
+      // skip next player once
+      room.skipNextFor = opp.socketId;
+
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+
+      room.log.push(`${room.players[meIdx].name} used Jack: ${opp.name} will be skipped.`);
+      advanceTurn(room);
+      emitRoom(room);
+      cb?.({ ok: true });
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  socket.on("power:queenUnseenSwap", ({ roomId, myIndex, oppIndex }, cb) => {
+    try {
+      const room = getRoomOrThrow(roomId);
+      ensureTurn(room, socket.id);
+      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
+      if (!room.activeDraw) throw new Error("No drawn card");
+      const c = room.activeDraw.card;
+      if (c.r !== "Q") throw new Error("Not a Queen");
+
+      if (![0,1,2,3].includes(myIndex)) throw new Error("Bad myIndex");
+      if (![0,1,2,3].includes(oppIndex)) throw new Error("Bad oppIndex");
+
+      const meIdx = room.turnIndex;
+      const me = room.players[meIdx];
+      const opp = room.players[(meIdx + 1) % 2];
+
+      // unseen swap: do it without revealing
+      const temp = me.hand[myIndex];
+      me.hand[myIndex] = opp.hand[oppIndex];
+      opp.hand[oppIndex] = temp;
+
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+
+      room.log.push(`${me.name} used Queen: unseen swap.`);
+      advanceTurn(room);
+      emitRoom(room);
+      cb?.({ ok: true });
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  // KING seen swap (K1): preview both chosen cards -> confirm swap
+  socket.on("power:kingPreview", ({ roomId, myIndex, oppIndex }, cb) => {
+    try {
+      const room = getRoomOrThrow(roomId);
+      ensureTurn(room, socket.id);
+      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
+      if (!room.activeDraw) throw new Error("No drawn card");
+      if (room.pending) throw new Error("Already pending");
+      const c = room.activeDraw.card;
+      if (c.r !== "K") throw new Error("Not a King");
+
+      if (![0,1,2,3].includes(myIndex)) throw new Error("Bad myIndex");
+      if (![0,1,2,3].includes(oppIndex)) throw new Error("Bad oppIndex");
+
+      const meIdx = room.turnIndex;
+      const me = room.players[meIdx];
+      const opp = room.players[(meIdx + 1) % 2];
+
+      room.pending = {
+        type: "KING_CONFIRM",
+        playerSocketId: socket.id,
+        myIndex,
+        oppIndex,
+        kingCard: c
+      };
+
+      // send preview privately
+      socket.emit("king:preview", {
+        myIndex,
+        oppIndex,
+        myCard: { ...me.hand[myIndex], base: baseValue(me.hand[myIndex]), score: scoreValue(me.hand[myIndex]) },
+        oppCard: { ...opp.hand[oppIndex], base: baseValue(opp.hand[oppIndex]), score: scoreValue(opp.hand[oppIndex]) }
+      });
+
+      cb?.({ ok: true });
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  socket.on("power:kingConfirm", ({ roomId, confirm }, cb) => {
+    try {
+      const room = getRoomOrThrow(roomId);
+      ensureTurn(room, socket.id);
+      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
+      if (!room.activeDraw) throw new Error("No drawn card");
+      if (!room.pending || room.pending.type !== "KING_CONFIRM") throw new Error("No pending king action");
+      if (room.pending.playerSocketId !== socket.id) throw new Error("Not your pending action");
+
+      const { myIndex, oppIndex } = room.pending;
+      const meIdx = room.turnIndex;
+      const me = room.players[meIdx];
+      const opp = room.players[(meIdx + 1) % 2];
+
+      if (confirm) {
+        const temp = me.hand[myIndex];
+        me.hand[myIndex] = opp.hand[oppIndex];
+        opp.hand[oppIndex] = temp;
+        room.log.push(`${me.name} used King: seen swap confirmed.`);
+      } else {
+        room.log.push(`${me.name} used King: swap cancelled.`);
+      }
+
+      // discard the King (used as power)
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+      room.pending = null;
+
+      advanceTurn(room);
+      emitRoom(room);
+      cb?.({ ok: true });
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
   socket.on("disconnect", () => {
-    // remove player from room
     for (const [id, room] of rooms.entries()) {
       const idx = room.players.findIndex(p => p.socketId === socket.id);
       if (idx >= 0) {
         const name = room.players[idx].name;
         room.players.splice(idx, 1);
         room.log.push(`${name} disconnected.`);
-        // If room empty, delete it
+
         if (room.players.length === 0) {
           rooms.delete(id);
         } else {
-          // reset game if someone leaves
           room.started = false;
           room.phase = "LOBBY";
           room.drawPile = [];
@@ -352,6 +658,9 @@ io.on("connection", (socket) => {
           room.activeDraw = null;
           room.caboCalledBy = null;
           room.lastTurnFor = null;
+          room.skipNextFor = null;
+          room.pending = null;
+          room.ended = null;
           room.log.push(`Back to lobby.`);
           emitRoom(room);
         }
@@ -361,22 +670,4 @@ io.on("connection", (socket) => {
   });
 });
 
-function advanceTurn(room) {
-  // if last turn finished, end game
-  if (room.lastTurnFor && room.players[room.turnIndex]?.socketId === room.lastTurnFor) {
-    // just completed last turn -> end
-    room.phase = "ENDED";
-    room.ended = scores(room);
-    room.log.push(`Round ended. Winner: ${room.ended.winnerName}`);
-    return;
-  }
-
-  // normal next turn
-  room.turnIndex = (room.turnIndex + 1) % room.players.length;
-  room.phase = "TURN_DRAW";
-  room.log.push(`${room.players[room.turnIndex].name}'s turn.`);
-}
-
-server.listen(PORT, () => {
-  console.log(`Kabo server listening on :${PORT}`);
-});
+server.listen(PORT, () => console.log(`Kabo server listening on :${PORT}`));
