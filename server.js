@@ -41,7 +41,7 @@ function scoreValue(card) {
   return baseValue(card);
 }
 
-// Crypto-strong Fisher–Yates shuffle
+// Crypto shuffle
 function shuffle(a) {
   for (let i = a.length - 1; i > 0; i--) {
     const j = crypto.randomInt(0, i + 1);
@@ -58,21 +58,20 @@ function isPowerCard(card) {
   return ["7","8","9","10","J","Q","K"].includes(card.r);
 }
 
-// When draw pile empties: keep top discard, reshuffle rest into draw pile
+/**
+ * RULE: You can NOT take from discard pile.
+ * BUT: to avoid running out of cards, when draw pile is empty,
+ * we recycle (shuffle) discard pile back into draw pile.
+ */
 function refillDrawPileIfNeeded(room) {
   if (room.drawPile.length > 0) return;
-  if (room.discardPile.length <= 1) throw new Error("No cards left to draw");
 
-  const top = room.discardPile.pop();           // keep top discard
-  const toShuffle = room.discardPile.splice(0); // everything else
-  room.drawPile = shuffle(toShuffle);
-  room.discardPile.push(top);
-}
+  if (room.discardPile.length === 0) {
+    throw new Error("No cards left to draw");
+  }
 
-// Used power cards should NOT become next discardTop
-function buryUsedPower(room, card) {
-  // Put under the pile so discardTop doesn't become that same power card
-  room.discardPile.unshift(card);
+  room.drawPile = shuffle(room.discardPile.splice(0));
+  room.log.push("Draw pile refilled from discard pile (reshuffled).");
 }
 
 /**
@@ -84,7 +83,7 @@ room = {
   drawPile,
   discardPile,
   phase: "LOBBY"|"PEEK"|"TURN_DRAW"|"TURN_DECIDE"|"LAST_TURN"|"ENDED",
-  activeDraw: null | { source:"draw"|"discard", card },
+  activeDraw: null | { card },
   caboCalledBy: null|socketId,
   lastTurnFor: null|socketId,
   skipNextFor: null|socketId,
@@ -133,7 +132,7 @@ function startGame(room) {
   }
 
   room.drawPile = deck;
-  room.discardPile = [room.drawPile.pop()];
+  room.discardPile = [];           // hidden discard pile (not drawable)
   room.started = true;
   room.turnIndex = 0;
   room.phase = "PEEK";
@@ -156,9 +155,9 @@ function scores(room) {
 }
 
 /**
- * ✅ PRIVACY FIX:
- * - NEVER include "activeDraw" or any drawn card in room:update
- * - The only drawn-card reveal is private: "turn:drawResult" to the active player
+ * PRIVACY + RULE:
+ * - No drawn card in room:update
+ * - No discard top shared (since discard is not usable)
  */
 function publicState(room, viewerSocketId) {
   const players = room.players.map(p => {
@@ -174,8 +173,6 @@ function publicState(room, viewerSocketId) {
     };
   });
 
-  const discardTop = room.discardPile[room.discardPile.length - 1] || null;
-
   return {
     id: room.id,
     started: room.started,
@@ -183,7 +180,7 @@ function publicState(room, viewerSocketId) {
     players,
     turnSocketId: room.started ? currentTurnSocket(room) : null,
     drawCount: room.drawPile.length,
-    discardTop: discardTop ? { ...discardTop, base: baseValue(discardTop), score: scoreValue(discardTop) } : null,
+    discardCount: room.discardPile.length,  // only count, no values
     caboCalledBy: room.caboCalledBy,
     lastTurnFor: room.lastTurnFor,
     log: room.log.slice(-10),
@@ -204,7 +201,6 @@ function endRound(room) {
 }
 
 function advanceTurn(room) {
-  // If this was the last-turn player finishing, end immediately
   if (room.lastTurnFor && currentTurnSocket(room) === room.lastTurnFor) {
     endRound(room);
     return;
@@ -227,6 +223,7 @@ function advanceTurn(room) {
 }
 
 io.on("connection", (socket) => {
+
   socket.on("room:create", ({ name }, cb) => {
     try {
       const id = roomId();
@@ -328,29 +325,31 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Take from draw/discard
+  /**
+   * TURN: DRAW ONLY
+   * - No more "take discard"
+   * - If client sends source:"discard", we reject
+   */
   socket.on("turn:take", ({ roomId, source }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
       if (!["TURN_DRAW","LAST_TURN"].includes(room.phase)) throw new Error("Not in draw phase");
       ensureTurn(room, socket.id);
-      if (room.activeDraw) throw new Error("Already took a card");
+      if (room.activeDraw) throw new Error("Already drew a card");
       if (room.pending) throw new Error("Resolve pending action first");
 
-      let card;
-      if (source === "draw") {
-        refillDrawPileIfNeeded(room);
-        card = room.drawPile.pop();
-      } else if (source === "discard") {
-        if (room.discardPile.length === 0) throw new Error("Discard empty");
-        card = room.discardPile.pop();
-      } else throw new Error("Bad source");
+      if (source && source !== "draw") {
+        throw new Error("Rule: You can only draw from the draw pile (no taking discard).");
+      }
 
-      room.activeDraw = { source, card };
+      refillDrawPileIfNeeded(room);
+      const card = room.drawPile.pop();
+
+      room.activeDraw = { card };
       room.phase = "TURN_DECIDE";
-      room.log.push(`${room.players[room.turnIndex].name} took a card.`);
+      room.log.push(`${room.players[room.turnIndex].name} drew a card.`);
 
-      // ✅ PRIVATE reveal to the active player ONLY
+      // PRIVATE reveal to current player only
       socket.emit("turn:drawResult", {
         card: { ...card, base: baseValue(card), score: scoreValue(card) },
         power: isPowerCard(card)
@@ -363,7 +362,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Swap drawn into hand (normal discard goes to TOP)
+  // Swap drawn into hand -> old card goes to discard pile (hidden)
   socket.on("turn:swap", ({ roomId, handIndex }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -377,7 +376,7 @@ io.on("connection", (socket) => {
       const old = p.hand[handIndex];
       p.hand[handIndex] = room.activeDraw.card;
 
-      room.discardPile.push(old);      // old card becomes discardTop
+      room.discardPile.push(old);  // hidden discard
       room.activeDraw = null;
 
       room.log.push(`${p.name} swapped a card.`);
@@ -389,7 +388,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // Discard drawn (normal discard goes to TOP)
+  // Discard drawn -> discard pile (hidden)
   socket.on("turn:discardDrawn", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -398,7 +397,7 @@ io.on("connection", (socket) => {
       if (!room.activeDraw) throw new Error("No drawn card");
       if (room.pending) throw new Error("Resolve pending action first");
 
-      room.discardPile.push(room.activeDraw.card); // becomes discardTop
+      room.discardPile.push(room.activeDraw.card); // hidden discard
       room.activeDraw = null;
 
       room.log.push(`${room.players[room.turnIndex].name} discarded drawn card.`);
@@ -438,8 +437,7 @@ io.on("connection", (socket) => {
   });
 
   // =====================
-  // POWERS (Option B): Use power then discard the drawn card
-  // ✅ FIX: bury used power cards (unshift) so they don't become discardTop
+  // POWERS (Option B): Use power then discard the drawn card (to hidden discard pile)
   // =====================
 
   socket.on("power:peekOwn", ({ roomId, handIndex }, cb) => {
@@ -460,7 +458,7 @@ io.on("connection", (socket) => {
         card: { ...p.hand[handIndex], base: baseValue(p.hand[handIndex]), score: scoreValue(p.hand[handIndex]) }
       });
 
-      buryUsedPower(room, room.activeDraw.card);
+      room.discardPile.push(room.activeDraw.card);
       room.activeDraw = null;
 
       room.log.push(`${p.name} used 7/8 to peek own card.`);
@@ -489,7 +487,7 @@ io.on("connection", (socket) => {
         card: { ...opp.hand[oppIndex], base: baseValue(opp.hand[oppIndex]), score: scoreValue(opp.hand[oppIndex]) }
       });
 
-      buryUsedPower(room, room.activeDraw.card);
+      room.discardPile.push(room.activeDraw.card);
       room.activeDraw = null;
 
       room.log.push(`${room.players[meIdx].name} used 9/10 to peek opponent.`);
@@ -512,7 +510,7 @@ io.on("connection", (socket) => {
       const opp = room.players[(meIdx + 1) % 2];
       room.skipNextFor = opp.socketId;
 
-      buryUsedPower(room, room.activeDraw.card);
+      room.discardPile.push(room.activeDraw.card);
       room.activeDraw = null;
 
       room.log.push(`${room.players[meIdx].name} used Jack: ${opp.name} will be skipped.`);
@@ -540,7 +538,7 @@ io.on("connection", (socket) => {
       me.hand[myIndex] = opp.hand[oppIndex];
       opp.hand[oppIndex] = temp;
 
-      buryUsedPower(room, room.activeDraw.card);
+      room.discardPile.push(room.activeDraw.card);
       room.activeDraw = null;
 
       room.log.push(`${me.name} used Queen: unseen swap.`);
@@ -550,7 +548,6 @@ io.on("connection", (socket) => {
     } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
 
-  // King seen swap (K1): preview both then confirm
   socket.on("power:kingPreview", ({ roomId, myIndex, oppIndex }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -602,7 +599,7 @@ io.on("connection", (socket) => {
         room.log.push(`${me.name} used King: swap cancelled.`);
       }
 
-      buryUsedPower(room, room.activeDraw.card);
+      room.discardPile.push(room.activeDraw.card);
       room.activeDraw = null;
       room.pending = null;
 
