@@ -377,7 +377,7 @@ io.on("connection", (socket) => {
     }
   });
 
-  // CABO (≤5)
+  // CABO (<10)
   socket.on("turn:cabo", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -385,7 +385,9 @@ io.on("connection", (socket) => {
       ensureTurn(room, socket.id);
 
       const sum = computeHandSumForCabo(room, socket.id);
-      if (sum > 5) throw new Error("Cabo not allowed (total must be 5 or less).");
+
+      // ✅ NEW RULE: must be < 10
+      if (sum >= 10) throw new Error("Cabo not allowed (total must be less than 10).");
 
       room.caboCalledBy = socket.id;
       const opp = room.players.find(p => p.socketId !== socket.id);
