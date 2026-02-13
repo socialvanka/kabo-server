@@ -57,9 +57,13 @@ function isPowerCard(card) {
   return ["7","8","9","10","J","Q","K"].includes(card.r);
 }
 
+function sameRank(a, b) {
+  return a && b && a.r === b.r;
+}
+
 /**
  * RULE: draw pile only.
- * if draw pile is empty, recycle discard pile into draw pile by shuffling.
+ * If draw pile empty => recycle discard into draw by shuffling.
  */
 function refillDrawPileIfNeeded(room) {
   if (room.drawPile.length > 0) return;
@@ -82,10 +86,6 @@ function ensurePlayer(room, socketId) {
   return idx;
 }
 
-function isHost(room, socketId) {
-  return room.players[0]?.socketId === socketId;
-}
-
 function currentTurnSocket(room) {
   return room.players[room.turnIndex]?.socketId ?? null;
 }
@@ -94,7 +94,7 @@ function ensureTurn(room, socketId) {
   if (currentTurnSocket(room) !== socketId) throw new Error("Not your turn");
 }
 
-function computeHandSumForCabo(room, socketId) {
+function computeHandSum(room, socketId) {
   const p = room.players.find(x => x.socketId === socketId);
   if (!p) throw new Error("Not in room");
   return p.hand.reduce((sum, c) => sum + scoreValue(c), 0);
@@ -111,19 +111,20 @@ function startGame(room) {
   }
 
   room.drawPile = deck;
-  room.discardPile = []; // "center pile"
+  room.discardPile = [];
   room.started = true;
   room.turnIndex = 0;
   room.phase = "PEEK";
-  room.activeDraw = null; // private drawn card for current player
+  room.activeDraw = null;
   room.caboCalledBy = null;
   room.lastTurnFor = null;
   room.skipNextFor = null;
   room.pending = null;
-  room.log = ["Game started. Each player: peek 2 cards (memory flip)."];
+  room.log = ["Game started. Each player: peek 2 cards (flip for 3s)."];
   room.ended = null;
 
-  room.val = { active:false, accepted:false, noStep:0, yesScale:1 };
+  room.valentineUnlocked = false;
+  room.valState = { noClicks: 0, accepted: false };
 }
 
 function scores(room) {
@@ -135,11 +136,6 @@ function scores(room) {
   return { scores: s, winnerName: s[0].name };
 }
 
-/**
- * Public state:
- * - No drawn card leak
- * - Center pile top is visible to both (like real game center)
- */
 function publicState(room, viewerSocketId) {
   const players = room.players.map(p => {
     const isMe = p.socketId === viewerSocketId;
@@ -150,11 +146,12 @@ function publicState(room, viewerSocketId) {
       hand: room.phase === "ENDED"
         ? p.hand.map(c => ({ ...c, base: baseValue(c), score: scoreValue(c) }))
         : p.hand.map(() => null),
+      handCount: p.hand.length,
       isMe
     };
   });
 
-  const top = room.discardPile.length ? room.discardPile[room.discardPile.length - 1] : null;
+  const top = room.discardPile.at(-1) || null;
 
   return {
     id: room.id,
@@ -163,12 +160,16 @@ function publicState(room, viewerSocketId) {
     players,
     turnSocketId: room.started ? currentTurnSocket(room) : null,
     drawCount: room.drawPile.length,
-    centerTop: top ? { ...top, base: baseValue(top), score: scoreValue(top) } : null,
+    discardCount: room.discardPile.length,
+    discardTop: top ? ({ ...top, base: baseValue(top), score: scoreValue(top) }) : null,
     caboCalledBy: room.caboCalledBy,
     lastTurnFor: room.lastTurnFor,
-    log: room.log.slice(-12),
+    log: room.log.slice(-14),
     ended: room.ended || null,
-    val: room.val || { active:false, accepted:false, noStep:0, yesScale:1 }
+
+    // valentine
+    valentineUnlocked: room.valentineUnlocked,
+    valState: room.valState
   };
 }
 
@@ -178,10 +179,19 @@ function emitRoom(room) {
   }
 }
 
+function unlockValentine(room) {
+  room.valentineUnlocked = true;
+  room.log.push("Valentine page unlocked 💜");
+  for (const p of room.players) {
+    io.to(p.socketId).emit("val:unlocked", { ok: true, valState: room.valState });
+  }
+}
+
 function endRound(room) {
   room.phase = "ENDED";
   room.ended = scores(room);
   room.log.push(`Round ended. Winner: ${room.ended.winnerName}`);
+  unlockValentine(room);
 }
 
 function advanceTurn(room) {
@@ -205,15 +215,8 @@ function advanceTurn(room) {
   room.log.push(`${room.players[room.turnIndex].name}'s turn.`);
 }
 
-function emitToRoom(room, event, payload) {
-  io.to(room.id).emit(event, payload);
-}
-
 io.on("connection", (socket) => {
 
-  // -----------------------
-  // Rooms
-  // -----------------------
   socket.on("room:create", ({ name }, cb) => {
     try {
       const id = roomId();
@@ -232,13 +235,14 @@ io.on("connection", (socket) => {
         pending: null,
         log: [],
         ended: null,
-        val: { active:false, accepted:false, noStep:0, yesScale:1 }
+        valentineUnlocked: false,
+        valState: { noClicks: 0, accepted: false }
       };
       rooms.set(id, room);
 
       room.players.push({
         socketId: socket.id,
-        name: (name || "Player 1").slice(0, 16),
+        name: (name || "Host").slice(0, 16),
         peeksLeft: 2,
         hand: []
       });
@@ -276,7 +280,7 @@ io.on("connection", (socket) => {
   socket.on("game:start", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
-      if (!isHost(room, socket.id)) throw new Error("Only host can start");
+      if (room.players[0]?.socketId !== socket.id) throw new Error("Only host can start");
       startGame(room);
       emitRoom(room);
       cb?.({ ok: true });
@@ -285,77 +289,44 @@ io.on("connection", (socket) => {
     }
   });
 
-  // -----------------------
-  // Host bypass (ANYTIME)
-  // -----------------------
-  socket.on("nav:bypass", ({ roomId }, cb) => {
+  // HOST BYPASS -> unlock valentine for both anytime
+  socket.on("room:bypass", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
-      if (!isHost(room, socket.id)) throw new Error("Only host can bypass");
-
-      room.val.active = true;
-      room.val.accepted = false;
-      room.val.noStep = 0;
-      room.val.yesScale = 1;
-      room.log.push("Host BYPASS → Valentine page.");
-
+      if (room.players[0]?.socketId !== socket.id) throw new Error("Only host can bypass");
+      room.log.push("Host bypassed → Valentine unlocked.");
+      unlockValentine(room);
       emitRoom(room);
-      emitToRoom(room, "nav:valentine", { reason: "BYPASS" });
-
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) {
       cb?.({ ok:false, error:e.message });
     }
   });
 
-  // Non-host unlock (or anyone)
-  socket.on("nav:unlockValentine", ({ roomId }, cb) => {
+  // Valentine sync events
+  socket.on("val:no", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
-      ensurePlayer(room, socket.id);
-
-      room.val.active = true;
-      room.log.push("Valentine unlocked.");
+      room.valState.noClicks = (room.valState.noClicks || 0) + 1;
+      room.log.push(`Valentine: NO clicked (${room.valState.noClicks}).`);
+      io.to(roomId).emit("val:update", { valState: room.valState });
       emitRoom(room);
-      emitToRoom(room, "nav:valentine", { reason: "UNLOCK" });
-
-      cb?.({ ok:true });
-    } catch (e) {
-      cb?.({ ok:false, error:e.message });
-    }
+      cb?.({ ok: true, valState: room.valState });
+    } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
 
-  // Valentine actions sync
-  socket.on("val:action", ({ roomId, action }, cb) => {
+  socket.on("val:yes", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
-      ensurePlayer(room, socket.id);
-      if (!room.val.active) throw new Error("Valentine not active");
-
-      if (action?.type === "NO_STEP") {
-        room.val.noStep = action.noStep ?? room.val.noStep;
-        room.val.yesScale = action.yesScale ?? room.val.yesScale;
-      }
-      if (action?.type === "YES_ACCEPT") {
-        room.val.accepted = true;
-      }
-
-      emitToRoom(room, "val:update", {
-        from: socket.id,
-        action,
-        snapshot: room.val
-      });
-
-      cb?.({ ok:true });
-    } catch (e) {
-      cb?.({ ok:false, error:e.message });
-    }
+      room.valState.accepted = true;
+      room.log.push("Valentine: YES clicked 💜");
+      io.to(roomId).emit("val:update", { valState: room.valState });
+      emitRoom(room);
+      cb?.({ ok: true, valState: room.valState });
+    } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
 
-  // -----------------------
-  // Peek: reveal only to that player
-  // (client shows flip for 3 seconds)
-  // -----------------------
+  // Peek (dynamic index)
   socket.on("game:peek", ({ roomId, index }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -363,7 +334,7 @@ io.on("connection", (socket) => {
       const pIdx = ensurePlayer(room, socket.id);
       const p = room.players[pIdx];
       if (p.peeksLeft <= 0) throw new Error("No peeks left");
-      if (![0,1,2,3].includes(index)) throw new Error("Bad index");
+      if (index < 0 || index >= p.hand.length) throw new Error("Bad index");
 
       p.peeksLeft -= 1;
 
@@ -373,7 +344,7 @@ io.on("connection", (socket) => {
         peeksLeft: p.peeksLeft
       });
 
-      room.log.push(`${p.name} peeked.`);
+      room.log.push(`${p.name} peeked a card.`);
       if (room.players.every(x => x.peeksLeft === 0)) {
         room.phase = "TURN_DRAW";
         room.log.push(`Peeks done. ${room.players[room.turnIndex].name}'s turn.`);
@@ -386,16 +357,15 @@ io.on("connection", (socket) => {
     }
   });
 
-  // -----------------------
-  // Draw (draw pile only)
-  // -----------------------
-  socket.on("turn:draw", ({ roomId }, cb) => {
+  // Draw only (no discard take)
+  socket.on("turn:take", ({ roomId, source }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
       if (!["TURN_DRAW","LAST_TURN"].includes(room.phase)) throw new Error("Not in draw phase");
       ensureTurn(room, socket.id);
       if (room.activeDraw) throw new Error("Already drew a card");
       if (room.pending) throw new Error("Resolve pending action first");
+      if (source && source !== "draw") throw new Error("Rule: draw pile only.");
 
       refillDrawPileIfNeeded(room);
       const card = room.drawPile.pop();
@@ -404,53 +374,46 @@ io.on("connection", (socket) => {
       room.phase = "TURN_DECIDE";
       room.log.push(`${room.players[room.turnIndex].name} drew a card.`);
 
-      // Send drawn only to current player
       socket.emit("turn:drawResult", {
         card: { ...card, base: baseValue(card), score: scoreValue(card) },
         power: isPowerCard(card)
       });
 
       emitRoom(room);
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) {
-      cb?.({ ok:false, error:e.message });
+      cb?.({ ok: false, error: e.message });
     }
   });
 
-  // -----------------------
-  // Swap drawn into hand
-  // Old card goes to center pile (visible)
-  // -----------------------
+  // Swap drawn into hand -> old card goes to center (discard pile)
   socket.on("turn:swap", ({ roomId, handIndex }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
       if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
       ensureTurn(room, socket.id);
       if (!room.activeDraw) throw new Error("No drawn card");
-      if (![0,1,2,3].includes(handIndex)) throw new Error("Bad index");
       if (room.pending) throw new Error("Resolve pending action first");
 
       const p = room.players[room.turnIndex];
+      if (handIndex < 0 || handIndex >= p.hand.length) throw new Error("Bad index");
 
       const old = p.hand[handIndex];
       p.hand[handIndex] = room.activeDraw.card;
 
-      // center pile gets the swapped-out card
-      room.discardPile.push(old);
-
+      room.discardPile.push(old); // center card becomes old one
       room.activeDraw = null;
-      room.log.push(`${p.name} swapped and placed a card in center.`);
+
+      room.log.push(`${p.name} swapped a card.`);
       advanceTurn(room);
       emitRoom(room);
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) {
-      cb?.({ ok:false, error:e.message });
+      cb?.({ ok: false, error: e.message });
     }
   });
 
-  // -----------------------
-  // Discard drawn to center pile
-  // -----------------------
+  // Discard drawn -> center pile
   socket.on("turn:discardDrawn", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -460,29 +423,26 @@ io.on("connection", (socket) => {
       if (room.pending) throw new Error("Resolve pending action first");
 
       room.discardPile.push(room.activeDraw.card);
-      const c = room.activeDraw.card;
       room.activeDraw = null;
 
-      room.log.push(`${room.players[room.turnIndex].name} placed drawn card in center (${c.r}${c.s}).`);
+      room.log.push(`${room.players[room.turnIndex].name} played drawn card to center.`);
       advanceTurn(room);
       emitRoom(room);
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) {
-      cb?.({ ok:false, error:e.message });
+      cb?.({ ok: false, error: e.message });
     }
   });
 
-  // -----------------------
   // CABO (<10)
-  // -----------------------
   socket.on("turn:cabo", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
-      if (room.phase !== "TURN_DRAW") throw new Error("Call CABO at start of your turn");
+      if (room.phase !== "TURN_DRAW") throw new Error("Call Cabo at start of your turn");
       ensureTurn(room, socket.id);
 
-      const sum = computeHandSumForCabo(room, socket.id);
-      if (sum >= 10) throw new Error("CABO not allowed (total must be < 10).");
+      const sum = computeHandSum(room, socket.id);
+      if (sum >= 10) throw new Error("Cabo not allowed (total must be less than 10).");
 
       room.caboCalledBy = socket.id;
       const opp = room.players.find(p => p.socketId !== socket.id);
@@ -495,26 +455,100 @@ io.on("connection", (socket) => {
       room.pending = null;
 
       emitRoom(room);
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) {
-      cb?.({ ok:false, error:e.message });
+      cb?.({ ok: false, error: e.message });
     }
   });
 
-  // ======================
-  // POWERS (consume drawn)
-  // NOTE: Power is ONLY from the drawn card.
-  // Client enables power only for drawn card.
-  // When a power is used, the drawn card is discarded to center pile.
-  // ======================
+  // =====================
+  // BURNING (anytime after center has a card, not in PEEK/ENDED)
+  // =====================
+  socket.on("burn:attempt", ({ roomId, target, index, giveIndex }, cb) => {
+    try {
+      const room = getRoomOrThrow(roomId);
 
-  function consumeDrawnToCenter(room) {
-    if (!room.activeDraw) throw new Error("No drawn card");
-    room.discardPile.push(room.activeDraw.card);
-    room.activeDraw = null;
-  }
+      if (["LOBBY","PEEK","ENDED"].includes(room.phase)) {
+        throw new Error("Burn not allowed right now.");
+      }
 
-  // 7/8 peek own
+      const top = room.discardPile.at(-1);
+      if (!top) throw new Error("Nothing to burn on (center pile empty).");
+
+      const burnerIdx = ensurePlayer(room, socket.id);
+      const burner = room.players[burnerIdx];
+      const victimIdx = (burnerIdx + 1) % 2;
+      const victim = room.players[victimIdx];
+
+      if (target === "self") {
+        if (index < 0 || index >= burner.hand.length) throw new Error("Bad index.");
+        const chosen = burner.hand[index];
+
+        if (sameRank(chosen, top)) {
+          burner.hand.splice(index, 1);
+          room.discardPile.push(chosen);
+          room.log.push(`${burner.name} burned a card!`);
+          emitRoom(room);
+          cb?.({ ok: true, result: "BURN_OK" });
+          return;
+        }
+
+        refillDrawPileIfNeeded(room);
+        const penalty = room.drawPile.pop();
+        burner.hand.push(penalty);
+        room.log.push(`${burner.name} tried to burn and missed (+1 penalty).`);
+        emitRoom(room);
+        cb?.({ ok: true, result: "BURN_WRONG_SELF" });
+        return;
+      }
+
+      if (target === "opp") {
+        if (index < 0 || index >= victim.hand.length) throw new Error("Bad opponent index.");
+        if (giveIndex < 0 || giveIndex >= burner.hand.length) throw new Error("Choose a card to give.");
+
+        const chosenVictimCard = victim.hand[index];
+
+        if (sameRank(chosenVictimCard, top)) {
+          // remove victim card -> center
+          victim.hand.splice(index, 1);
+          room.discardPile.push(chosenVictimCard);
+
+          // burner gives one of their cards to victim (face down)
+          const gift = burner.hand.splice(giveIndex, 1)[0];
+          victim.hand.push(gift);
+
+          room.log.push(`${burner.name} steal-burned successfully!`);
+          emitRoom(room);
+          cb?.({ ok: true, result: "BURN_OK_STEAL" });
+          return;
+        }
+
+        // wrong steal burn: reveal victim card to burner + penalty
+        socket.emit("burn:revealWrong", {
+          index,
+          card: { ...chosenVictimCard, base: baseValue(chosenVictimCard), score: scoreValue(chosenVictimCard) }
+        });
+
+        refillDrawPileIfNeeded(room);
+        const penalty = room.drawPile.pop();
+        burner.hand.push(penalty);
+
+        room.log.push(`${burner.name} steal-burned wrongly (+1 penalty, revealed card).`);
+        emitRoom(room);
+        cb?.({ ok: true, result: "BURN_WRONG_STEAL" });
+        return;
+      }
+
+      throw new Error("Bad target.");
+    } catch (e) {
+      cb?.({ ok: false, error: e.message });
+    }
+  });
+
+  // =====================
+  // POWERS (power only from drawn card; power never from burned card)
+  // Using a power discards the drawn card to center.
+  // =====================
   socket.on("power:peekOwn", ({ roomId, handIndex }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -523,9 +557,9 @@ io.on("connection", (socket) => {
       if (!room.activeDraw) throw new Error("No drawn card");
       const c = room.activeDraw.card;
       if (!["7","8"].includes(c.r)) throw new Error("Not 7/8");
-      if (![0,1,2,3].includes(handIndex)) throw new Error("Bad index");
 
       const p = room.players[room.turnIndex];
+      if (handIndex < 0 || handIndex >= p.hand.length) throw new Error("Bad index");
 
       socket.emit("power:reveal", {
         kind: "own",
@@ -533,15 +567,16 @@ io.on("connection", (socket) => {
         card: { ...p.hand[handIndex], base: baseValue(p.hand[handIndex]), score: scoreValue(p.hand[handIndex]) }
       });
 
-      consumeDrawnToCenter(room);
-      room.log.push(`${p.name} used 7/8 to peek own.`);
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+
+      room.log.push(`${p.name} used 7/8 (peek own).`);
       advanceTurn(room);
       emitRoom(room);
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
 
-  // 9/10 peek opponent
   socket.on("power:peekOpp", ({ roomId, oppIndex }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -550,10 +585,10 @@ io.on("connection", (socket) => {
       if (!room.activeDraw) throw new Error("No drawn card");
       const c = room.activeDraw.card;
       if (!["9","10"].includes(c.r)) throw new Error("Not 9/10");
-      if (![0,1,2,3].includes(oppIndex)) throw new Error("Bad index");
 
       const meIdx = room.turnIndex;
       const opp = room.players[(meIdx + 1) % 2];
+      if (oppIndex < 0 || oppIndex >= opp.hand.length) throw new Error("Bad index");
 
       socket.emit("power:reveal", {
         kind: "opp",
@@ -561,15 +596,16 @@ io.on("connection", (socket) => {
         card: { ...opp.hand[oppIndex], base: baseValue(opp.hand[oppIndex]), score: scoreValue(opp.hand[oppIndex]) }
       });
 
-      consumeDrawnToCenter(room);
-      room.log.push(`${room.players[meIdx].name} used 9/10 to peek opponent.`);
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+
+      room.log.push(`${room.players[meIdx].name} used 9/10 (peek opp).`);
       advanceTurn(room);
       emitRoom(room);
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
 
-  // Jack skip
   socket.on("power:jackSkip", ({ roomId }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -583,15 +619,16 @@ io.on("connection", (socket) => {
       const opp = room.players[(meIdx + 1) % 2];
       room.skipNextFor = opp.socketId;
 
-      consumeDrawnToCenter(room);
-      room.log.push(`${room.players[meIdx].name} used Jack: ${opp.name} skipped.`);
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+
+      room.log.push(`${room.players[meIdx].name} used Jack (skip opp).`);
       advanceTurn(room);
       emitRoom(room);
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
 
-  // Queen unseen swap
   socket.on("power:queenUnseenSwap", ({ roomId, myIndex, oppIndex }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -600,25 +637,28 @@ io.on("connection", (socket) => {
       if (!room.activeDraw) throw new Error("No drawn card");
       const c = room.activeDraw.card;
       if (c.r !== "Q") throw new Error("Not a Queen");
-      if (![0,1,2,3].includes(myIndex) || ![0,1,2,3].includes(oppIndex)) throw new Error("Bad index");
 
       const meIdx = room.turnIndex;
       const me = room.players[meIdx];
       const opp = room.players[(meIdx + 1) % 2];
 
+      if (myIndex < 0 || myIndex >= me.hand.length) throw new Error("Bad my index");
+      if (oppIndex < 0 || oppIndex >= opp.hand.length) throw new Error("Bad opp index");
+
       const temp = me.hand[myIndex];
       me.hand[myIndex] = opp.hand[oppIndex];
       opp.hand[oppIndex] = temp;
 
-      consumeDrawnToCenter(room);
-      room.log.push(`${me.name} used Queen: unseen swap.`);
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
+
+      room.log.push(`${me.name} used Queen (unseen swap).`);
       advanceTurn(room);
       emitRoom(room);
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
 
-  // King preview -> confirm
   socket.on("power:kingPreview", ({ roomId, myIndex, oppIndex }, cb) => {
     try {
       const room = getRoomOrThrow(roomId);
@@ -628,13 +668,15 @@ io.on("connection", (socket) => {
       if (room.pending) throw new Error("Already pending");
       const c = room.activeDraw.card;
       if (c.r !== "K") throw new Error("Not a King");
-      if (![0,1,2,3].includes(myIndex) || ![0,1,2,3].includes(oppIndex)) throw new Error("Bad index");
-
-      room.pending = { type: "KING_CONFIRM", playerSocketId: socket.id, myIndex, oppIndex };
 
       const meIdx = room.turnIndex;
       const me = room.players[meIdx];
       const opp = room.players[(meIdx + 1) % 2];
+
+      if (myIndex < 0 || myIndex >= me.hand.length) throw new Error("Bad my index");
+      if (oppIndex < 0 || oppIndex >= opp.hand.length) throw new Error("Bad opp index");
+
+      room.pending = { type: "KING_CONFIRM", playerSocketId: socket.id, myIndex, oppIndex };
 
       socket.emit("king:preview", {
         myIndex,
@@ -643,7 +685,7 @@ io.on("connection", (socket) => {
         oppCard: { ...opp.hand[oppIndex], base: baseValue(opp.hand[oppIndex]), score: scoreValue(opp.hand[oppIndex]) }
       });
 
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
 
@@ -665,23 +707,21 @@ io.on("connection", (socket) => {
         const temp = me.hand[myIndex];
         me.hand[myIndex] = opp.hand[oppIndex];
         opp.hand[oppIndex] = temp;
-        room.log.push(`${me.name} used King: swap confirmed.`);
+        room.log.push(`${me.name} used King (seen swap confirmed).`);
       } else {
-        room.log.push(`${me.name} used King: swap cancelled.`);
+        room.log.push(`${me.name} cancelled King swap.`);
       }
 
-      consumeDrawnToCenter(room);
+      room.discardPile.push(room.activeDraw.card);
+      room.activeDraw = null;
       room.pending = null;
 
       advanceTurn(room);
       emitRoom(room);
-      cb?.({ ok:true });
+      cb?.({ ok: true });
     } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
 
-  // -----------------------
-  // Disconnect cleanup
-  // -----------------------
   socket.on("disconnect", () => {
     for (const [id, room] of rooms.entries()) {
       const idx = room.players.findIndex(p => p.socketId === socket.id);
