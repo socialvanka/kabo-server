@@ -122,6 +122,7 @@ function startGame(room) {
   room.pending = null;
   room.log = ["Game started. Each player: peek 2 cards (flip for 3s)."];
   room.ended = null;
+  room.centerPower = null;
 
   room.valentineUnlocked = false;
   room.valState = { noClicks: 0, accepted: false };
@@ -215,6 +216,20 @@ function advanceTurn(room) {
   room.log.push(`${room.players[room.turnIndex].name}'s turn.`);
 }
 
+function maybeEnterCenterPower(room, ownerSocketId, cardJustPlacedOnCenter) {
+  if (!isPowerCard(cardJustPlacedOnCenter)) return false;
+
+  room.centerPower = { card: cardJustPlacedOnCenter, ownerSocketId };
+  room.phase = "CENTER_POWER";
+
+  io.to(ownerSocketId).emit("center:powerAvailable", {
+    card: { ...cardJustPlacedOnCenter, base: baseValue(cardJustPlacedOnCenter), score: scoreValue(cardJustPlacedOnCenter) }
+  });
+
+  room.log.push(`Center power available for ${room.players.find(p=>p.socketId===ownerSocketId)?.name}.`);
+  return true;
+}
+
 io.on("connection", (socket) => {
 
   socket.on("room:create", ({ name }, cb) => {
@@ -236,7 +251,9 @@ io.on("connection", (socket) => {
         log: [],
         ended: null,
         valentineUnlocked: false,
-        valState: { noClicks: 0, accepted: false }
+        valState: { noClicks: 0, accepted: false },
+
+        centerPower: null
       };
       rooms.set(id, room);
 
@@ -388,51 +405,99 @@ io.on("connection", (socket) => {
 
   // Swap drawn into hand -> old card goes to center (discard pile)
   socket.on("turn:swap", ({ roomId, handIndex }, cb) => {
-    try {
-      const room = getRoomOrThrow(roomId);
-      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
-      ensureTurn(room, socket.id);
-      if (!room.activeDraw) throw new Error("No drawn card");
-      if (room.pending) throw new Error("Resolve pending action first");
+  try {
+    const room = getRoomOrThrow(roomId);
+    if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
+    ensureTurn(room, socket.id);
+    if (!room.activeDraw) throw new Error("No drawn card");
+    if (room.pending) throw new Error("Resolve pending action first");
 
-      const p = room.players[room.turnIndex];
-      if (handIndex < 0 || handIndex >= p.hand.length) throw new Error("Bad index");
+    const p = room.players[room.turnIndex];
+    if (handIndex < 0 || handIndex >= p.hand.length) throw new Error("Bad index");
 
-      const old = p.hand[handIndex];
-      p.hand[handIndex] = room.activeDraw.card;
+    const old = p.hand[handIndex];
+    p.hand[handIndex] = room.activeDraw.card;
 
-      room.discardPile.push(old); // center card becomes old one
-      room.activeDraw = null;
+    // old card goes to center
+    room.discardPile.push(old);
+    room.activeDraw = null;
 
-      room.log.push(`${p.name} swapped a card.`);
+    room.log.push(`${p.name} swapped and played a card to center.`);
+
+    // ✅ NEW: If the CENTER card is a power card, allow power
+    const entered = maybeEnterCenterPower(room, socket.id, old);
+    emitRoom(room);
+
+    if (!entered) {
       advanceTurn(room);
       emitRoom(room);
-      cb?.({ ok: true });
-    } catch (e) {
-      cb?.({ ok: false, error: e.message });
     }
-  });
+
+    cb?.({ ok: true });
+  } catch (e) {
+    cb?.({ ok: false, error: e.message });
+  }
+});
 
   // Discard drawn -> center pile
   socket.on("turn:discardDrawn", ({ roomId }, cb) => {
-    try {
-      const room = getRoomOrThrow(roomId);
-      if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
-      ensureTurn(room, socket.id);
-      if (!room.activeDraw) throw new Error("No drawn card");
-      if (room.pending) throw new Error("Resolve pending action first");
+  try {
+    const room = getRoomOrThrow(roomId);
+    if (room.phase !== "TURN_DECIDE") throw new Error("Not in decide phase");
+    ensureTurn(room, socket.id);
+    if (!room.activeDraw) throw new Error("No drawn card");
+    if (room.pending) throw new Error("Resolve pending action first");
 
-      room.discardPile.push(room.activeDraw.card);
-      room.activeDraw = null;
+    const played = room.activeDraw.card;
 
-      room.log.push(`${room.players[room.turnIndex].name} played drawn card to center.`);
+    room.discardPile.push(played);
+    room.activeDraw = null;
+
+    room.log.push(`${room.players[room.turnIndex].name} played drawn card to center.`);
+
+    // ✅ NEW: allow center power if the played card is power
+    const entered = maybeEnterCenterPower(room, socket.id, played);
+    emitRoom(room);
+
+    if (!entered) {
       advanceTurn(room);
       emitRoom(room);
-      cb?.({ ok: true });
-    } catch (e) {
-      cb?.({ ok: false, error: e.message });
     }
-  });
+
+    cb?.({ ok: true });
+  } catch (e) {
+    cb?.({ ok: false, error: e.message });
+  }
+});
+
+socket.on("centerPower:skip", ({ roomId }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    if (room.phase !== "CENTER_POWER") throw new Error("No center power to skip");
+    if (!room.centerPower || room.centerPower.ownerSocketId !== socket.id) throw new Error("Not your center power");
+
+    room.centerPower = null;
+    room.log.push(`Center power skipped.`);
+    advanceTurn(room);
+    emitRoom(room);
+
+    cb?.({ ok: true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
+socket.on("centerPower:skip", ({ roomId }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    if (room.phase !== "CENTER_POWER") throw new Error("No center power to skip");
+    if (!room.centerPower || room.centerPower.ownerSocketId !== socket.id) throw new Error("Not your center power");
+
+    room.centerPower = null;
+    room.log.push(`Center power skipped.`);
+    advanceTurn(room);
+    emitRoom(room);
+
+    cb?.({ ok: true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
 
   // CABO (<10)
   socket.on("turn:cabo", ({ roomId }, cb) => {
@@ -721,6 +786,219 @@ io.on("connection", (socket) => {
       cb?.({ ok: true });
     } catch (e) { cb?.({ ok:false, error:e.message }); }
   });
+function requireCenterPower(room, socketId) {
+  if (room.phase !== "CENTER_POWER") throw new Error("Not in center power phase");
+  if (!room.centerPower) throw new Error("No center power");
+  if (room.centerPower.ownerSocketId !== socketId) throw new Error("Not your center power");
+  return room.centerPower.card;
+}
+
+// 7/8 peek own
+socket.on("centerPower:peekOwn", ({ roomId, handIndex }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    ensureTurn(room, socket.id);
+
+    const c = requireCenterPower(room, socket.id);
+    if (!["7","8"].includes(c.r)) throw new Error("Not 7/8");
+    const p = room.players[room.turnIndex];
+    if (handIndex < 0 || handIndex >= p.hand.length) throw new Error("Bad index");
+
+    socket.emit("power:reveal", {
+      kind: "own",
+      index: handIndex,
+      card: { ...p.hand[handIndex], base: baseValue(p.hand[handIndex]), score: scoreValue(p.hand[handIndex]) }
+    });
+
+    room.centerPower = null;
+    room.log.push(`${p.name} used CENTER 7/8 (peek own).`);
+    advanceTurn(room);
+    emitRoom(room);
+    cb?.({ ok:true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
+
+// 9/10 peek opp
+socket.on("centerPower:peekOpp", ({ roomId, oppIndex }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    ensureTurn(room, socket.id);
+
+    const c = requireCenterPower(room, socket.id);
+    if (!["9","10"].includes(c.r)) throw new Error("Not 9/10");
+
+    const meIdx = room.turnIndex;
+    const opp = room.players[(meIdx + 1) % 2];
+    if (oppIndex < 0 || oppIndex >= opp.hand.length) throw new Error("Bad index");
+
+    socket.emit("power:reveal", {
+      kind: "opp",
+      index: oppIndex,
+      card: { ...opp.hand[oppIndex], base: baseValue(opp.hand[oppIndex]), score: scoreValue(opp.hand[oppIndex]) }
+    });
+
+    room.centerPower = null;
+    room.log.push(`${room.players[meIdx].name} used CENTER 9/10 (peek opp).`);
+    advanceTurn(room);
+    emitRoom(room);
+    cb?.({ ok:true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
+
+// Jack skip
+socket.on("centerPower:jackSkip", ({ roomId }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    ensureTurn(room, socket.id);
+
+    const c = requireCenterPower(room, socket.id);
+    if (c.r !== "J") throw new Error("Not Jack");
+
+    const meIdx = room.turnIndex;
+    const opp = room.players[(meIdx + 1) % 2];
+    room.skipNextFor = opp.socketId;
+
+    room.centerPower = null;
+    room.log.push(`${room.players[meIdx].name} used CENTER Jack (skip).`);
+    advanceTurn(room);
+    emitRoom(room);
+    cb?.({ ok:true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
+
+// Queen unseen swap
+socket.on("centerPower:queenUnseenSwap", ({ roomId, myIndex, oppIndex }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    ensureTurn(room, socket.id);
+
+    const c = requireCenterPower(room, socket.id);
+    if (c.r !== "Q") throw new Error("Not Queen");
+
+    const meIdx = room.turnIndex;
+    const meP = room.players[meIdx];
+    const opp = room.players[(meIdx + 1) % 2];
+    if (myIndex < 0 || myIndex >= meP.hand.length) throw new Error("Bad my index");
+    if (oppIndex < 0 || oppIndex >= opp.hand.length) throw new Error("Bad opp index");
+
+    const tmp = meP.hand[myIndex];
+    meP.hand[myIndex] = opp.hand[oppIndex];
+    opp.hand[oppIndex] = tmp;
+
+    room.centerPower = null;
+    room.log.push(`${meP.name} used CENTER Queen (unseen swap).`);
+    advanceTurn(room);
+    emitRoom(room);
+    cb?.({ ok:true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
+
+function requireCenterPower(room, socketId) {
+  if (room.phase !== "CENTER_POWER") throw new Error("Not in center power phase");
+  if (!room.centerPower) throw new Error("No center power");
+  if (room.centerPower.ownerSocketId !== socketId) throw new Error("Not your center power");
+  return room.centerPower.card;
+}
+
+// 7/8 peek own
+socket.on("centerPower:peekOwn", ({ roomId, handIndex }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    ensureTurn(room, socket.id);
+
+    const c = requireCenterPower(room, socket.id);
+    if (!["7","8"].includes(c.r)) throw new Error("Not 7/8");
+    const p = room.players[room.turnIndex];
+    if (handIndex < 0 || handIndex >= p.hand.length) throw new Error("Bad index");
+
+    socket.emit("power:reveal", {
+      kind: "own",
+      index: handIndex,
+      card: { ...p.hand[handIndex], base: baseValue(p.hand[handIndex]), score: scoreValue(p.hand[handIndex]) }
+    });
+
+    room.centerPower = null;
+    room.log.push(`${p.name} used CENTER 7/8 (peek own).`);
+    advanceTurn(room);
+    emitRoom(room);
+    cb?.({ ok:true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
+
+// 9/10 peek opp
+socket.on("centerPower:peekOpp", ({ roomId, oppIndex }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    ensureTurn(room, socket.id);
+
+    const c = requireCenterPower(room, socket.id);
+    if (!["9","10"].includes(c.r)) throw new Error("Not 9/10");
+
+    const meIdx = room.turnIndex;
+    const opp = room.players[(meIdx + 1) % 2];
+    if (oppIndex < 0 || oppIndex >= opp.hand.length) throw new Error("Bad index");
+
+    socket.emit("power:reveal", {
+      kind: "opp",
+      index: oppIndex,
+      card: { ...opp.hand[oppIndex], base: baseValue(opp.hand[oppIndex]), score: scoreValue(opp.hand[oppIndex]) }
+    });
+
+    room.centerPower = null;
+    room.log.push(`${room.players[meIdx].name} used CENTER 9/10 (peek opp).`);
+    advanceTurn(room);
+    emitRoom(room);
+    cb?.({ ok:true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
+
+// Jack skip
+socket.on("centerPower:jackSkip", ({ roomId }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    ensureTurn(room, socket.id);
+
+    const c = requireCenterPower(room, socket.id);
+    if (c.r !== "J") throw new Error("Not Jack");
+
+    const meIdx = room.turnIndex;
+    const opp = room.players[(meIdx + 1) % 2];
+    room.skipNextFor = opp.socketId;
+
+    room.centerPower = null;
+    room.log.push(`${room.players[meIdx].name} used CENTER Jack (skip).`);
+    advanceTurn(room);
+    emitRoom(room);
+    cb?.({ ok:true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
+
+// Queen unseen swap
+socket.on("centerPower:queenUnseenSwap", ({ roomId, myIndex, oppIndex }, cb) => {
+  try {
+    const room = getRoomOrThrow(roomId);
+    ensureTurn(room, socket.id);
+
+    const c = requireCenterPower(room, socket.id);
+    if (c.r !== "Q") throw new Error("Not Queen");
+
+    const meIdx = room.turnIndex;
+    const meP = room.players[meIdx];
+    const opp = room.players[(meIdx + 1) % 2];
+    if (myIndex < 0 || myIndex >= meP.hand.length) throw new Error("Bad my index");
+    if (oppIndex < 0 || oppIndex >= opp.hand.length) throw new Error("Bad opp index");
+
+    const tmp = meP.hand[myIndex];
+    meP.hand[myIndex] = opp.hand[oppIndex];
+    opp.hand[oppIndex] = tmp;
+
+    room.centerPower = null;
+    room.log.push(`${meP.name} used CENTER Queen (unseen swap).`);
+    advanceTurn(room);
+    emitRoom(room);
+    cb?.({ ok:true });
+  } catch (e) { cb?.({ ok:false, error:e.message }); }
+});
 
   socket.on("disconnect", () => {
     for (const [id, room] of rooms.entries()) {
